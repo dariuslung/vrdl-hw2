@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+
+# IDE/Editor (Optional)
+.vscode/
+.idea/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Specific
+checkpoints/
+data/
+runs/
+*.tar.gz
+*.zip
+*.Identifier
