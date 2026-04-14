@@ -1,10 +1,13 @@
+import json
 import math
 import os
 import sys
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torchvision.transforms as transforms
 from scipy.optimize import linear_sum_assignment
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LinearLR, SequentialLR, StepLR
@@ -15,6 +18,7 @@ from torchmetrics.detection import MeanAveragePrecision
 from torchvision.models import ResNet50_Weights, resnet50
 from torchvision.ops import box_convert, generalized_box_iou, sigmoid_focal_loss
 from tqdm import tqdm
+from PIL import Image
 
 from dataset import setup_dataloaders
 from models.detr import SetCriterion
@@ -316,14 +320,20 @@ def main():
     model = DigitDETR(num_classes=num_classes)
     model.to(device)
 
-    # Note: torch.compile has been removed to avoid the missing triton dependency error.
-
-    # EMA: Initialize the AveragedModel for weight smoothing (decay = 0.999)
     ema_avg_fn = get_ema_multi_avg_fn(0.999)
     ema_model = AveragedModel(model, multi_avg_fn=ema_avg_fn)
 
     matcher = FocalHungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
-    weight_dict = {'loss_ce': 2.0, 'loss_bbox': 5.0, 'loss_giou': 2.0}
+    
+    # OPTIMIZATION: Deep Supervision / Auxiliary Loss weights added
+    base_weight_dict = {'loss_ce': 2.0, 'loss_bbox': 5.0, 'loss_giou': 2.0}
+    weight_dict = base_weight_dict.copy()
+    
+    # DETR has 6 decoder layers, meaning 5 auxiliary outputs (index 0 to 4)
+    aux_weight_dict = {}
+    for i in range(5):
+        aux_weight_dict.update({f'{k}_{i}': v for k, v in base_weight_dict.items()})
+    weight_dict.update(aux_weight_dict)
 
     criterion = DeformableSetCriterion(
         num_classes=num_classes,
