@@ -1,122 +1,61 @@
-import json
-import os
-from pathlib import Path
-
-import torch
-import torch.nn as nn
-import torchvision.transforms as transforms
-from PIL import Image
-from torch.amp import autocast
-from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
-from torchvision.ops import box_convert
-from tqdm import tqdm
-
-# Import the model architecture from the training script
-from train import DigitDETR
-
-
-@torch.no_grad()
-def generate_submission(
-    model: nn.Module, 
-    test_img_dir: str, 
-    transform: transforms.Compose, 
-    device: torch.device, 
-    output_file: str = "pred.json"
-):
-    """
-    Evaluates the test directory and formats outputs exactly to the assignment requirements.
-    """
+def generate_predictions(model, test_img_dir, output_file="pred.json"):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.eval()
-    test_dir = Path(test_img_dir)
+    
+    transform = get_transforms()
     predictions = []
     
-    # Parses all images in the test directory
-    image_paths = list(test_dir.glob("*.png")) + list(test_dir.glob("*.jpg"))
-    progress_bar = tqdm(image_paths, desc="[Inference] Generating Submission", dynamic_ncols=True)
-    
-    for img_path in progress_bar:
-        try:
-            # Assumes the filename '1234.png' corresponds to image_id 1234
-            image_id = int(img_path.stem) 
-        except ValueError:
-            continue
+    for img_name in os.listdir(test_img_dir):
+        # Extract image_id from filename depending on your dataset structure
+        # Assuming filename is something like "00001.jpg"
+        image_id = int(os.path.splitext(img_name)[0])
+        img_path = os.path.join(test_img_dir, img_name)
+        
+        orig_image = Image.open(img_path).convert("RGB")
+        orig_w, orig_h = orig_image.size
+        
+        image_np = np.array(orig_image)
+        # Apply transform without bboxes
+        transformed = transform(image=image_np)
+        input_tensor = transformed['image'].unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            outputs = model(pixel_values=input_tensor)
             
-        original_image = Image.open(img_path).convert("RGB")
-        img_w, img_h = original_image.size
+        # Post-process to original image size
+        # Albumentations padded the image. We need to account for the scale factor.
+        scale = 512 / max(orig_h, orig_w)
+        new_h, new_w = int(orig_h * scale), int(orig_w * scale)
         
-        image_tensor = transform(original_image).unsqueeze(0).to(device)
+        probas = outputs.logits.softmax(-1)[0, :, :-1]
+        keep = probas.max(-1).values > 0.5 # Confidence threshold
         
-        with autocast('cuda'):
-            outputs = model(image_tensor)
-        
-        pred_logits = outputs['pred_logits'][0]
-        pred_boxes = outputs['pred_boxes'][0]
-        
-        pred_scores, pred_labels = pred_logits.sigmoid().max(dim=-1)
-        
-        # Scale normalized coordinates back to the original unpadded image resolution
-        scale_tensor = torch.tensor([img_w, img_h, img_w, img_h], device=device)
-        pred_boxes_xyxy = box_convert(pred_boxes, 'cxcywh', 'xyxy') * scale_tensor
-        pred_boxes_xywh = box_convert(pred_boxes_xyxy, 'xyxy', 'xywh')
-        
-        keep = pred_scores > 0.3
-        boxes = pred_boxes_xywh[keep].cpu().numpy()
-        scores = pred_scores[keep].cpu().numpy()
-        labels = pred_labels[keep].cpu().numpy()
+        boxes = outputs.pred_boxes[0, keep].cpu().numpy()
+        scores = probas[keep].max(-1).values.cpu().numpy()
+        labels = probas[keep].argmax(-1).cpu().numpy()
         
         for box, score, label in zip(boxes, scores, labels):
+            cx, cy, w, h = box
+            
+            # Convert normalized 512x512 coordinates to absolute padded coordinates
+            abs_cx, abs_cy = cx * 512, cy * 512
+            abs_w, abs_h = w * 512, h * 512
+            
+            # Map back to original unpadded dimensions
+            orig_cx = abs_cx / scale
+            orig_cy = abs_cy / scale
+            orig_box_w = abs_w / scale
+            orig_box_h = abs_h / scale
+            
+            x_min = orig_cx - (orig_box_w / 2)
+            y_min = orig_cy - (orig_box_h / 2)
+            
             predictions.append({
                 "image_id": image_id,
-                "bbox": box.tolist(),
+                "bbox": [float(x_min), float(y_min), float(orig_box_w), float(orig_box_h)],
                 "score": float(score),
-                "category_id": int(label) + 1  # Map 0-9 network output back to 1-10 labels
+                "category_id": int(label)
             })
             
-    with open(output_file, "w") as f:
+    with open(output_file, 'w') as f:
         json.dump(predictions, f, indent=4)
-        
-    print(f"--> Successfully saved test predictions to {output_file}")
-
-
-def main():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    print("Instantiating model...")
-    num_classes = 10
-    model = DigitDETR(num_classes=num_classes)
-    model.to(device)
-
-    # Recreate the EMA configuration to ensure keys match during weight loading
-    ema_avg_fn = get_ema_multi_avg_fn(0.999)
-    ema_model = AveragedModel(model, multi_avg_fn=ema_avg_fn)
-    
-    save_dir = "checkpoints"
-    checkpoint_path = os.path.join(save_dir, "detr_best_model.pth")
-    
-    if not os.path.exists(checkpoint_path):
-        print(f"Error: Checkpoint file not found at {checkpoint_path}. Train the model first.")
-        return
-
-    print("\nLoading best weights for test set inference...")
-    best_checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    ema_model.load_state_dict(best_checkpoint['ema_model_state_dict'])
-    
-    # We use the standard validation transform for consistent sizing during testing
-    test_transform = transforms.Compose([
-        transforms.Resize(400, max_size=800),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    generate_submission(
-        model=ema_model,
-        test_img_dir="./data/test",
-        transform=test_transform,
-        device=device,
-        output_file="pred.json"
-    )
-
-
-if __name__ == '__main__':
-    main()
