@@ -47,6 +47,10 @@ class DetrTransform:
         labels = []
         for t in target:
             x, y, bw, bh = t["bbox"]
+
+            # Skip invalid bounding boxes to prevent division by zero
+            if bw <= 0 or bh <= 0:
+                continue
             
             # Convert COCO [x_min, y_min, w, h] to normalized [cx, cy, w, h]
             cx = (x + bw / 2) / w
@@ -65,10 +69,12 @@ class DetrTransform:
             labels = torch.empty((0,), dtype=torch.int64)
 
         # 2. Add image_id to the output dictionary as a tensor
+        # Add orig_size to the output dictionary
         target_dict = {
             "boxes": boxes,
             "labels": labels,
-            "image_id": torch.tensor([image_id], dtype=torch.int64) 
+            "image_id": torch.tensor([image_id], dtype=torch.int64),
+            "orig_size": torch.tensor([h, w], dtype=torch.int64)
         }
         
         return image, target_dict
@@ -124,7 +130,7 @@ def get_dataloaders(batch_size, num_workers):
     return train_loader, valid_loader
 
 
-def train_one_epoch(model, criterion, dataloader, optimizer, scaler, device, epoch, writer):
+def train_one_epoch(model, criterion, dataloader, optimizer, device, epoch, writer):
     model.train()
     total_loss = 0.0
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]", leave=False)
@@ -135,26 +141,28 @@ def train_one_epoch(model, criterion, dataloader, optimizer, scaler, device, epo
 
         optimizer.zero_grad()
 
-        # Mixed precision for speed and memory efficiency
-        with autocast():
-            # 1. Forward pass only takes images
+        # Switch to bfloat16 to prevent overflow
+        with autocast(dtype=torch.bfloat16):
             outputs = model(images)
             
-            # 2. Criterion takes the outputs and targets to compute bipartite matching loss
-            loss_dict = criterion(outputs, targets)
-            weight_dict = criterion.weight_dict
-            
-            # 3. Sum the weighted loss components
-            loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+        outputs_fp32 = {k: v.float() for k, v in outputs.items() if isinstance(v, torch.Tensor)}
+        if "aux_outputs" in outputs:
+            outputs_fp32["aux_outputs"] = [
+                {k: v.float() for k, v in aux_dict.items()} 
+                for aux_dict in outputs["aux_outputs"]
+            ]
 
-        scaler.scale(loss).backward()
+        # Calculate loss in full precision
+        loss_dict = criterion(outputs_fp32, targets)
+        weight_dict = criterion.weight_dict
         
-        # Gradient clipping is standard for DETR stability
-        scaler.unscale_(optimizer)
+        loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+
+        # No scaler needed for bfloat16, standard backward pass
+        loss.backward()
+        
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-        
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
 
         total_loss += loss.item()
         
@@ -191,18 +199,21 @@ def validate_and_eval(
         images = list(image.to(device) for image in images)
         # Ensure targets are on the correct device for the criterion
         targets_device = [{k: v.to(device) for k, v in t.items()} for t in targets]
-        img_sizes = torch.tensor([img.shape[-2:] for img in images]).to(device)
+        orig_sizes = torch.stack([t["orig_size"] for t in targets_device])
         
-        with autocast():
+        with autocast(dtype=torch.bfloat16):
             outputs = model(images)
             
-            # 1. Compute Loss
-            loss_dict = criterion(outputs, targets_device)
-            weight_dict = criterion.weight_dict
-            loss = sum(
-                loss_dict[k] * weight_dict[k] 
-                for k in loss_dict.keys() if k in weight_dict
-            )
+        outputs_fp32 = {k: v.float() for k, v in outputs.items() if isinstance(v, torch.Tensor)}
+        if "aux_outputs" in outputs:
+            outputs_fp32["aux_outputs"] = [
+                {k: v.float() for k, v in aux_dict.items()} 
+                for aux_dict in outputs["aux_outputs"]
+            ]
+            
+        loss_dict = criterion(outputs_fp32, targets_device)
+        weight_dict = criterion.weight_dict
+        loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
             
         total_loss += loss.item()
         
@@ -214,7 +225,7 @@ def validate_and_eval(
         scores, labels = prob[..., :10].max(-1)
         
         boxes = box_cxcywh_to_xywh(out_boxes)
-        img_h, img_w = img_sizes.unbind(1)
+        img_h, img_w = orig_sizes.unbind(1)
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
         boxes = boxes * scale_fct[:, None, :]
         
@@ -308,13 +319,11 @@ def main():
     
     # Step scheduler reduces learning rate by a factor of 10 at epoch 40 (standard DETR behavior)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.1)
-    scaler = GradScaler()
 
     best_map = 0.0
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(model, criterion, train_loader, optimizer, scaler, device, epoch, writer)
-        
+        train_loss = train_one_epoch(model, criterion, train_loader, optimizer, device, epoch, writer)        
         val_loss, current_map = validate_and_eval(model, criterion, valid_loader, device, epoch, writer)
         
         lr_scheduler.step()
