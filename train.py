@@ -13,8 +13,80 @@ from torchvision.models.resnet import ResNet50_Weights
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+import sys
+# Point to the new Deformable-DETR directory
+sys.path.append("Deformable-DETR")
+
+from models.deformable_transformer import DeformableTransformer
+from models.deformable_detr import DeformableDETR, SetCriterion
 from models.matcher import HungarianMatcher
-from models.detr import SetCriterion
+from models.backbone import build_backbone
+import argparse
+
+
+def get_deformable_detr_model(device):
+    # 1. Setup minimal arguments required by the Deformable DETR builder
+    args = argparse.Namespace(
+        lr_backbone=1e-5,
+        masks=False,
+        backbone='resnet50',
+        dilation=False,
+        position_embedding='sine',
+        hidden_dim=256,
+        enc_layers=6,
+        dec_layers=6,
+        dim_feedforward=1024,
+        dropout=0.1,
+        nheads=8,
+        num_feature_levels=4,
+        dec_n_points=4,
+        enc_n_points=4,
+        two_stage=False,
+        num_classes=10
+    )
+
+    # 2. Build the backbone (handles the multi-scale feature extraction)
+    backbone = build_backbone(args)
+
+    # 3. Build the Deformable Transformer
+    transformer = DeformableTransformer(
+        d_model=args.hidden_dim,
+        nhead=args.nheads,
+        num_encoder_layers=args.enc_layers,
+        num_decoder_layers=args.dec_layers,
+        dim_feedforward=args.dim_feedforward,
+        dropout=args.dropout,
+        activation="relu",
+        return_intermediate_dec=True,
+        num_feature_levels=args.num_feature_levels,
+        dec_n_points=args.dec_n_points,
+        enc_n_points=args.enc_n_points,
+        two_stage=args.two_stage,
+    )
+
+    # 4. Initialize Deformable DETR
+    model = DeformableDETR(
+        backbone,
+        transformer,
+        num_classes=args.num_classes,
+        num_queries=300, # Deformable DETR typically uses 300 queries
+        num_feature_levels=args.num_feature_levels,
+    )
+    
+    # Initialize the specific matcher and criterion for Deformable DETR
+    matcher = HungarianMatcher(cost_class=2, cost_bbox=5, cost_giou=2)
+    weight_dict = {'loss_ce': 2, 'loss_bbox': 5, 'loss_giou': 2}
+    losses = ['labels', 'boxes', 'cardinality']
+    
+    criterion = SetCriterion(
+        args.num_classes, 
+        matcher=matcher, 
+        weight_dict=weight_dict, 
+        losses=losses,
+        focal_alpha=0.25 # Deformable DETR uses Focal Loss for classification
+    )
+    
+    return model.to(device), criterion.to(device)
 
 
 class DetrTransform:
@@ -141,24 +213,16 @@ def train_one_epoch(model, criterion, dataloader, optimizer, device, epoch, writ
 
         optimizer.zero_grad()
 
-        # Switch to bfloat16 to prevent overflow
-        with autocast(dtype=torch.bfloat16):
-            outputs = model(images)
-            
-        outputs_fp32 = {k: v.float() for k, v in outputs.items() if isinstance(v, torch.Tensor)}
-        if "aux_outputs" in outputs:
-            outputs_fp32["aux_outputs"] = [
-                {k: v.float() for k, v in aux_dict.items()} 
-                for aux_dict in outputs["aux_outputs"]
-            ]
+        # Run forward pass in standard FP32. 
+        # Autocast must be removed to support the custom Deformable Attention CUDA kernel.
+        outputs = model(images)
 
-        # Calculate loss in full precision
-        loss_dict = criterion(outputs_fp32, targets)
+        # Calculate loss directly
+        loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
         
         loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
-        # No scaler needed for bfloat16, standard backward pass
         loss.backward()
         
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
@@ -197,32 +261,26 @@ def validate_and_eval(
 
     for images, targets in progress_bar:
         images = list(image.to(device) for image in images)
-        # Ensure targets are on the correct device for the criterion
         targets_device = [{k: v.to(device) for k, v in t.items()} for t in targets]
         orig_sizes = torch.stack([t["orig_size"] for t in targets_device])
         
-        with autocast(dtype=torch.bfloat16):
-            outputs = model(images)
+        # Standard FP32 forward pass
+        outputs = model(images)
             
-        outputs_fp32 = {k: v.float() for k, v in outputs.items() if isinstance(v, torch.Tensor)}
-        if "aux_outputs" in outputs:
-            outputs_fp32["aux_outputs"] = [
-                {k: v.float() for k, v in aux_dict.items()} 
-                for aux_dict in outputs["aux_outputs"]
-            ]
-            
-        loss_dict = criterion(outputs_fp32, targets_device)
+        loss_dict = criterion(outputs, targets_device)
         weight_dict = criterion.weight_dict
         loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
             
         total_loss += loss.item()
         
-        # 2. Compute mAP predictions
+        # Compute mAP predictions
         out_logits = outputs['pred_logits']
         out_boxes = outputs['pred_boxes']
         
-        prob = F.softmax(out_logits, -1)
-        scores, labels = prob[..., :10].max(-1)
+        # Deformable DETR uses Focal Loss, meaning probabilities are evaluated via Sigmoid.
+        # No background class slicing is required.
+        prob = out_logits.sigmoid()
+        scores, labels = prob.max(-1)
         
         boxes = box_cxcywh_to_xywh(out_boxes)
         img_h, img_w = orig_sizes.unbind(1)
@@ -245,11 +303,9 @@ def validate_and_eval(
                     "score": score
                 })
 
-    # Log Loss
     avg_loss = total_loss / len(dataloader)
     writer.add_scalar("Valid/Total_Loss", avg_loss, epoch)
     
-    # Calculate and Log mAP
     if not coco_results:
         map_50_95 = 0.0
     else:
@@ -278,33 +334,12 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    writer = SummaryWriter(log_dir="runs/detr_digit_detection")
+    writer = SummaryWriter(log_dir="runs/deformable_detr_digits")
 
     train_loader, valid_loader = get_dataloaders(args.batch_size, args.num_workers)
 
-    # Initialize model: 10 classes for the digits (0-9). 
-    # DETR will automatically add the 11th class internally for the "background".
-    model = torch.hub.load(
-        'facebookresearch/detr:main', 
-        'detr_resnet50', 
-        pretrained=False, 
-        num_classes=10
-    )
-    model.to(device)
-
-    # Initialize DETR Matcher and Criterion
-    matcher = HungarianMatcher(cost_class=1, cost_bbox=5, cost_giou=2)
-    weight_dict = {'loss_ce': 1, 'loss_bbox': 5, 'loss_giou': 2}
-    losses = ['labels', 'boxes', 'cardinality']
-    
-    criterion = SetCriterion(
-        num_classes=10, 
-        matcher=matcher, 
-        weight_dict=weight_dict, 
-        eos_coef=0.1, 
-        losses=losses
-    )
-    criterion.to(device)
+    # Initialize model: 10 classes for the digits (0-9). The model will be built with a ResNet-50 backbone and a Deformable Transformer head.
+    model, criterion = get_deformable_detr_model(device)
 
     # Standard DETR optimization: train the transformer parameters with a higher LR
     # than the backbone parameters to avoid destroying pretrained feature representations.
@@ -317,7 +352,7 @@ def main():
     ]
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
     
-    # Step scheduler reduces learning rate by a factor of 10 at epoch 40 (standard DETR behavior)
+    # Step scheduler reduces learning rate by a factor of 10 at epoch 40
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.1)
 
     best_map = 0.0

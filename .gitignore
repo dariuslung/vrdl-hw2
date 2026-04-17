@@ -28,3 +28,5 @@ runs/
 *.zip
 *.Identifier
 pred.json
+Deformable-DETR/
+delete_me/
