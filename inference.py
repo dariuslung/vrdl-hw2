@@ -28,7 +28,7 @@ def get_inference_model(model_path, device):
         enc_layers=6,
         dec_layers=6,
         dim_feedforward=1024,
-        dropout=0.1,
+        dropout=0.2,
         nheads=8,
         num_feature_levels=4,
         dec_n_points=4,

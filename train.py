@@ -21,7 +21,6 @@ from models.deformable_transformer import DeformableTransformer
 from models.deformable_detr import DeformableDETR, SetCriterion
 from models.matcher import HungarianMatcher
 from models.backbone import build_backbone
-import argparse
 
 
 def get_deformable_detr_model(device):
@@ -36,7 +35,7 @@ def get_deformable_detr_model(device):
         enc_layers=6,
         dec_layers=6,
         dim_feedforward=1024,
-        dropout=0.1,
+        dropout=0.2,
         nheads=8,
         num_feature_levels=4,
         dec_n_points=4,
@@ -94,10 +93,19 @@ class DetrTransform:
     Transforms PIL Images and COCO bounding boxes into the format expected by DETR.
     Resizes images to ensure they fit within 8GB VRAM while preserving aspect ratios.
     """
-    def __init__(self, max_size=600):
+    def __init__(self, max_size=600, train=True):
         self.max_size = max_size
-
+        self.train = train
+        
     def __call__(self, image, target):
+        if self.train:
+            # Random Brightness [0.8, 1.2]
+            bright_factor = 0.8 + 0.4 * torch.rand(1).item()
+            image = TF.adjust_brightness(image, bright_factor)
+            
+            # Random Contrast [0.8, 1.2]
+            contrast_factor = 0.8 + 0.4 * torch.rand(1).item()
+            image = TF.adjust_contrast(image, contrast_factor)
         w, h = image.size
         scale = self.max_size / max(w, h)
         new_w, new_h = int(w * scale), int(h * scale)
@@ -167,18 +175,22 @@ def collate_fn(batch):
 
 
 def get_dataloaders(batch_size, num_workers):
-    transform = DetrTransform(max_size=600)
+    # Pass train=True for the training dataset
+    train_transform = DetrTransform(max_size=600, train=True)
+    
+    # Pass train=False for the validation dataset
+    valid_transform = DetrTransform(max_size=600, train=False)
 
     train_dataset = CocoDetection(
         root="data/train",
         annFile="data/train.json",
-        transforms=transform
+        transforms=train_transform
     )
     
     valid_dataset = CocoDetection(
         root="data/valid",
         annFile="data/valid.json",
-        transforms=transform
+        transforms=valid_transform
     )
 
     train_loader = DataLoader(
@@ -323,12 +335,12 @@ def validate_and_eval(
 
 def main():
     parser = argparse.ArgumentParser(description="Train DETR for Digit Detection")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr_backbone", type=float, default=1e-5)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--output_dir", type=str, default="checkpoints")
     args = parser.parse_args()
 
@@ -352,8 +364,8 @@ def main():
     ]
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
     
-    # Step scheduler reduces learning rate by a factor of 10 at epoch 40
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.1)
+    # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
+    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[15, 25], gamma=0.1)
 
     best_map = 0.0
 
