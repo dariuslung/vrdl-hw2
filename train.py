@@ -1,5 +1,6 @@
 import os
 import argparse
+import random
 import json
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
@@ -73,8 +74,8 @@ def get_deformable_detr_model(device):
     )
     
     # Initialize the specific matcher and criterion for Deformable DETR
-    matcher = HungarianMatcher(cost_class=2, cost_bbox=5, cost_giou=2)
-    weight_dict = {'loss_ce': 2, 'loss_bbox': 5, 'loss_giou': 2}
+    matcher = HungarianMatcher(cost_class=2, cost_bbox=5, cost_giou=5)
+    weight_dict = {'loss_ce': 2, 'loss_bbox': 5, 'loss_giou': 5}
     losses = ['labels', 'boxes', 'cardinality']
     
     criterion = SetCriterion(
@@ -91,24 +92,69 @@ def get_deformable_detr_model(device):
 class DetrTransform:
     """
     Transforms PIL Images and COCO bounding boxes into the format expected by DETR.
-    Resizes images to ensure they fit within 8GB VRAM while preserving aspect ratios.
+    Includes random scaling and cropping during training to prevent overfitting.
     """
     def __init__(self, max_size=600, train=True):
         self.max_size = max_size
         self.train = train
-        
+
     def __call__(self, image, target):
+        import random
+import torch
+import torchvision.transforms.functional as TF
+
+class DetrTransform:
+    """
+    Transforms PIL Images and COCO bounding boxes into the format expected by DETR.
+    Includes photometric augmentations and bounded relative scaling during training.
+    """
+    def __init__(self, max_size=600, train=True):
+        self.max_size = max_size
+        self.train = train
+
+    def __call__(self, image, target):
+        # 1. Photometric Augmentations
         if self.train:
-            # Random Brightness [0.8, 1.2]
-            bright_factor = 0.8 + 0.4 * torch.rand(1).item()
-            image = TF.adjust_brightness(image, bright_factor)
+            if random.random() < 0.5:
+                bright_factor = random.uniform(0.8, 1.2)
+                image = TF.adjust_brightness(image, bright_factor)
             
-            # Random Contrast [0.8, 1.2]
-            contrast_factor = 0.8 + 0.4 * torch.rand(1).item()
-            image = TF.adjust_contrast(image, contrast_factor)
+            if random.random() < 0.5:
+                contrast_factor = random.uniform(0.8, 1.2)
+                image = TF.adjust_contrast(image, contrast_factor)
+
+        # Safely extract image_id
+        image_id = target[0]["image_id"] if len(target) > 0 else -1
+
+        # Extract absolute COCO boxes [x, y, w, h] and labels
+        valid_targets = [t for t in target if t["bbox"][2] > 0 and t["bbox"][3] > 0]
+        boxes = [t["bbox"] for t in valid_targets]
+        labels = [t["category_id"] - 1 for t in valid_targets]
+
         w, h = image.size
-        scale = self.max_size / max(w, h)
-        new_w, new_h = int(w * scale), int(h * scale)
+
+        # 2. Bounded Relative Scaling
+        if self.train:
+            scale_factor = random.uniform(0.8, 1.2)
+        else:
+            scale_factor = 1.0
+
+        new_w = int(w * scale_factor)
+        new_h = int(h * scale_factor)
+
+        # Limit 1: Prevent feature map collapse for small digits
+        min_dim = min(new_w, new_h)
+        if min_dim < 400:
+            fix_scale = 400.0 / min_dim
+            new_w = int(new_w * fix_scale)
+            new_h = int(new_h * fix_scale)
+
+        # Limit 2: Prevent OOM and slowdowns on large images
+        max_dim = max(new_w, new_h)
+        if max_dim > self.max_size:
+            fix_scale = self.max_size / max_dim
+            new_w = int(new_w * fix_scale)
+            new_h = int(new_h * fix_scale)
 
         image = TF.resize(image, (new_h, new_w))
         image = TF.to_tensor(image)
@@ -116,42 +162,25 @@ class DetrTransform:
             image, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
         )
 
-        # 1. Safely extract the image_id. 
-        # If an image has no digits (empty target list), we provide a fallback value.
-        if len(target) > 0:
-            image_id = target[0]["image_id"]
-        else:
-            image_id = -1 
-
-        boxes = []
-        labels = []
-        for t in target:
-            x, y, bw, bh = t["bbox"]
-
-            # Skip invalid bounding boxes to prevent division by zero
-            if bw <= 0 or bh <= 0:
-                continue
-            
-            # Convert COCO [x_min, y_min, w, h] to normalized [cx, cy, w, h]
-            cx = (x + bw / 2) / w
-            cy = (y + bh / 2) / h
+        # 3. Final Conversion to DETR Format (Relative [cx, cy, w, h])
+        normalized_boxes = []
+        for box in boxes:
+            bx, by, bw, bh = box
+            cx = (bx + bw / 2) / w
+            cy = (by + bh / 2) / h
             norm_w = bw / w
             norm_h = bh / h
-            
-            boxes.append([cx, cy, norm_w, norm_h])
-            labels.append(t["category_id"] - 1)
+            normalized_boxes.append([cx, cy, norm_w, norm_h])
 
-        if len(boxes) > 0:
-            boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        if len(normalized_boxes) > 0:
+            normalized_boxes = torch.as_tensor(normalized_boxes, dtype=torch.float32)
             labels = torch.as_tensor(labels, dtype=torch.int64)
         else:
-            boxes = torch.empty((0, 4), dtype=torch.float32)
+            normalized_boxes = torch.empty((0, 4), dtype=torch.float32)
             labels = torch.empty((0,), dtype=torch.int64)
 
-        # 2. Add image_id to the output dictionary as a tensor
-        # Add orig_size to the output dictionary
         target_dict = {
-            "boxes": boxes,
+            "boxes": normalized_boxes,
             "labels": labels,
             "image_id": torch.tensor([image_id], dtype=torch.int64),
             "orig_size": torch.tensor([h, w], dtype=torch.int64)
@@ -335,7 +364,7 @@ def validate_and_eval(
 
 def main():
     parser = argparse.ArgumentParser(description="Train DETR for Digit Detection")
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -364,18 +393,26 @@ def main():
     ]
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
     
-    # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[15, 25], gamma=0.1)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=14, gamma=0.1)
+    # lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[15, 25], gamma=0.1)
 
     best_map = 0.0
 
     for epoch in range(1, args.epochs + 1):
+        # param_groups[0] is the transformer/main model
+        # param_groups[1] is the backbone
+        current_lr = optimizer.param_groups[0]['lr']
+        current_lr_backbone = optimizer.param_groups[1]['lr']
+        
+        writer.add_scalar("Hyperparameters/LR_Main", current_lr, epoch)
+        writer.add_scalar("Hyperparameters/LR_Backbone", current_lr_backbone, epoch)
+
         train_loss = train_one_epoch(model, criterion, train_loader, optimizer, device, epoch, writer)        
         val_loss, current_map = validate_and_eval(model, criterion, valid_loader, device, epoch, writer)
         
         lr_scheduler.step()
         
-        print(f"Epoch [{epoch}/{args.epochs}] | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | mAP: {current_map:.4f}")
+        print(f"Epoch [{epoch}/{args.epochs}] | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | mAP: {current_map:.4f} | LR: {current_lr:.6f}")
 
         if current_map > best_map:
             best_map = current_map

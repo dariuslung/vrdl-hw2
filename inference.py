@@ -95,8 +95,24 @@ class TestDataset(Dataset):
         image = Image.open(img_path).convert("RGB")
         w, h = image.size
         
-        scale = self.max_size / max(w, h)
-        new_w, new_h = int(w * scale), int(h * scale)
+        # Exact bounded scaling used in training/validation
+        scale_factor = 1.0
+        new_w = int(w * scale_factor)
+        new_h = int(h * scale_factor)
+
+        # Limit 1: Prevent feature map collapse for small digits
+        min_dim = min(new_w, new_h)
+        if min_dim < 400:
+            fix_scale = 400.0 / min_dim
+            new_w = int(new_w * fix_scale)
+            new_h = int(new_h * fix_scale)
+
+        # Limit 2: Prevent large images from exceeding max_size
+        max_dim = max(new_w, new_h)
+        if max_dim > self.max_size:
+            fix_scale = self.max_size / max_dim
+            new_w = int(new_w * fix_scale)
+            new_h = int(new_h * fix_scale)
 
         image_tensor = TF.resize(image, (new_h, new_w))
         image_tensor = TF.to_tensor(image_tensor)
@@ -181,6 +197,9 @@ def main():
                     "score": score,
                     "category_id": label + 1  # Revert to 1-indexed category
                 })
+
+    # Sort descending by score so COCO evaluates your best guesses first
+    predictions = sorted(predictions, key=lambda x: x['score'], reverse=True)
 
     # Save to JSON
     with open(args.output_file, "w") as f:
