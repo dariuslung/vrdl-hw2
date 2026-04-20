@@ -24,9 +24,9 @@ def get_inference_model(model_path, device):
         backbone='resnet50',
         dilation=False,
         position_embedding='sine',
-        hidden_dim=256,
-        enc_layers=6,
-        dec_layers=6,
+        hidden_dim=128,
+        enc_layers=3,
+        dec_layers=3,
         dim_feedforward=1024,
         dropout=0.2,
         nheads=8,
@@ -58,7 +58,7 @@ def get_inference_model(model_path, device):
         backbone,
         transformer,
         num_classes=args.num_classes,
-        num_queries=300,
+        num_queries=20,
         num_feature_levels=args.num_feature_levels,
     )
 

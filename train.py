@@ -32,9 +32,9 @@ def get_deformable_detr_model(device):
         backbone='resnet50',
         dilation=False,
         position_embedding='sine',
-        hidden_dim=256,
-        enc_layers=6,
-        dec_layers=6,
+        hidden_dim=128,
+        enc_layers=3,
+        dec_layers=3,
         dim_feedforward=1024,
         dropout=0.2,
         nheads=8,
@@ -69,7 +69,7 @@ def get_deformable_detr_model(device):
         backbone,
         transformer,
         num_classes=args.num_classes,
-        num_queries=300, # Deformable DETR typically uses 300 queries
+        num_queries=20, # Deformable DETR typically uses 300 queries but reduce this for simpler dataset
         num_feature_levels=args.num_feature_levels,
     )
     
@@ -113,8 +113,9 @@ class DetrTransform:
         self.train = train
 
     def __call__(self, image, target):
-        # 1. Photometric Augmentations
+        # 1. Photometric and Quality Augmentations
         if self.train:
+            # Brightness & Contrast
             if random.random() < 0.5:
                 bright_factor = random.uniform(0.8, 1.2)
                 image = TF.adjust_brightness(image, bright_factor)
@@ -122,6 +123,16 @@ class DetrTransform:
             if random.random() < 0.5:
                 contrast_factor = random.uniform(0.8, 1.2)
                 image = TF.adjust_contrast(image, contrast_factor)
+                
+            # Saturation
+            if random.random() < 0.5:
+                saturation_factor = random.uniform(0.5, 1.5)
+                image = TF.adjust_saturation(image, saturation_factor)
+                
+            # Gaussian Blur (simulates out-of-focus cameras)
+            if random.random() < 0.3:
+                # Kernel size must be odd. 3 or 5 is safe for digits.
+                image = TF.gaussian_blur(image, kernel_size=[3, 3])
 
         # Safely extract image_id
         image_id = target[0]["image_id"] if len(target) > 0 else -1
@@ -364,7 +375,7 @@ def validate_and_eval(
 
 def main():
     parser = argparse.ArgumentParser(description="Train DETR for Digit Detection")
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -393,8 +404,12 @@ def main():
     ]
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
     
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=14, gamma=0.1)
-    # lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[15, 25], gamma=0.1)
+    # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=14, gamma=0.1)
+    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer, 
+        milestones=[15, 25], 
+        gamma=0.1
+    )
 
     best_map = 0.0
 
