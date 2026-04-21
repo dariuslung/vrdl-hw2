@@ -24,16 +24,17 @@ def get_inference_model(model_path, device):
         backbone='resnet50',
         dilation=False,
         position_embedding='sine',
-        hidden_dim=128,
-        enc_layers=3,
-        dec_layers=3,
+        hidden_dim=256,
+        enc_layers=4,
+        dec_layers=4,
         dim_feedforward=1024,
         dropout=0.2,
         nheads=8,
         num_feature_levels=4,
         dec_n_points=4,
         enc_n_points=4,
-        two_stage=False,
+        two_stage=True,
+        with_box_refine=True,  # Required for two-stage
         num_classes=10
     )
 
@@ -58,9 +59,16 @@ def get_inference_model(model_path, device):
         backbone,
         transformer,
         num_classes=args.num_classes,
-        num_queries=20,
+        num_queries=50,
         num_feature_levels=args.num_feature_levels,
+        two_stage=args.two_stage,             # Pass two_stage here
+        with_box_refine=args.with_box_refine  # Pass box_refine here
     )
+
+    # Inject the prediction heads into the transformer for proposal generation
+    if args.two_stage:
+        model.transformer.decoder.class_embed = model.class_embed
+        model.transformer.decoder.bbox_embed = model.bbox_embed
 
     # Load the trained weights
     state_dict = torch.load(model_path, map_location="cpu")

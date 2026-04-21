@@ -25,30 +25,28 @@ from models.backbone import build_backbone
 
 
 def get_deformable_detr_model(device):
-    # 1. Setup minimal arguments required by the Deformable DETR builder
     args = argparse.Namespace(
         lr_backbone=1e-5,
         masks=False,
-        backbone='resnet50',
+        backbone='resnet50',  # Sticking with ResNet-50
         dilation=False,
         position_embedding='sine',
-        hidden_dim=128,
-        enc_layers=3,
-        dec_layers=3,
+        hidden_dim=256,
+        enc_layers=4,         # Reduced layers
+        dec_layers=4,
         dim_feedforward=1024,
         dropout=0.2,
         nheads=8,
         num_feature_levels=4,
         dec_n_points=4,
         enc_n_points=4,
-        two_stage=False,
+        two_stage=True,       # Enabled
+        with_box_refine=True, # MANDATORY for two-stage formatting
         num_classes=10
     )
 
-    # 2. Build the backbone (handles the multi-scale feature extraction)
     backbone = build_backbone(args)
 
-    # 3. Build the Deformable Transformer
     transformer = DeformableTransformer(
         d_model=args.hidden_dim,
         nhead=args.nheads,
@@ -64,18 +62,35 @@ def get_deformable_detr_model(device):
         two_stage=args.two_stage,
     )
 
-    # 4. Initialize Deformable DETR
     model = DeformableDETR(
         backbone,
         transformer,
         num_classes=args.num_classes,
-        num_queries=20, # Deformable DETR typically uses 300 queries but reduce this for simpler dataset
+        num_queries=50, 
         num_feature_levels=args.num_feature_levels,
+        two_stage=args.two_stage,                 # Pass two_stage here
+        with_box_refine=args.with_box_refine      # Pass box_refine here
     )
+
+    # --- THE CRITICAL FIX ---
+    # Inject the prediction heads into the transformer for proposal generation
+    if args.two_stage:
+        model.transformer.decoder.class_embed = model.class_embed
+        model.transformer.decoder.bbox_embed = model.bbox_embed
+    # ------------------------
     
-    # Initialize the specific matcher and criterion for Deformable DETR
     matcher = HungarianMatcher(cost_class=2, cost_bbox=5, cost_giou=5)
     weight_dict = {'loss_ce': 2, 'loss_bbox': 5, 'loss_giou': 5}
+    
+    # If using with_box_refine, Deformable DETR expects loss weights for every layer
+    # so we need to duplicate the weights for the intermediate decoder outputs.
+    clean_weight_dict = weight_dict.copy()
+    for i in range(args.dec_layers - 1):
+        weight_dict.update({k + f'_{i}': v for k, v in clean_weight_dict.items()})
+    
+    # Two-stage also adds an encoder loss we need to track
+    weight_dict.update({k + f'_enc': v for k, v in clean_weight_dict.items()})
+
     losses = ['labels', 'boxes', 'cardinality']
     
     criterion = SetCriterion(
@@ -83,7 +98,7 @@ def get_deformable_detr_model(device):
         matcher=matcher, 
         weight_dict=weight_dict, 
         losses=losses,
-        focal_alpha=0.25 # Deformable DETR uses Focal Loss for classification
+        focal_alpha=0.25 
     )
     
     return model.to(device), criterion.to(device)
@@ -123,16 +138,6 @@ class DetrTransform:
             if random.random() < 0.5:
                 contrast_factor = random.uniform(0.8, 1.2)
                 image = TF.adjust_contrast(image, contrast_factor)
-                
-            # Saturation
-            if random.random() < 0.5:
-                saturation_factor = random.uniform(0.5, 1.5)
-                image = TF.adjust_saturation(image, saturation_factor)
-                
-            # Gaussian Blur (simulates out-of-focus cameras)
-            if random.random() < 0.3:
-                # Kernel size must be odd. 3 or 5 is safe for digits.
-                image = TF.gaussian_blur(image, kernel_size=[3, 3])
 
         # Safely extract image_id
         image_id = target[0]["image_id"] if len(target) > 0 else -1
