@@ -1,23 +1,24 @@
-import os
 import argparse
 import json
-import torch
-import torchvision.transforms.functional as TF
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image
-from tqdm import tqdm
+import os
 import sys
 
 # Point to the Deformable-DETR directory
 sys.path.append("Deformable-DETR")
 
-from models.deformable_transformer import DeformableTransformer
-from models.deformable_detr import DeformableDETR
+import torch
+import torchvision.transforms.functional as TF
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
 from models.backbone import build_backbone
+from models.deformable_detr import DeformableDETR
+from models.deformable_transformer import DeformableTransformer
 
 
 def get_inference_model(model_path, device):
-    """Initializes the Deformable DETR model architecture and loads the trained weights."""
+    """Initializes architecture and loads the trained weights."""
     args = argparse.Namespace(
         lr_backbone=1e-5,
         masks=False,
@@ -34,7 +35,7 @@ def get_inference_model(model_path, device):
         dec_n_points=4,
         enc_n_points=4,
         two_stage=True,
-        with_box_refine=True,  # Required for two-stage
+        with_box_refine=True,
         num_classes=10
     )
 
@@ -61,34 +62,37 @@ def get_inference_model(model_path, device):
         num_classes=args.num_classes,
         num_queries=50,
         num_feature_levels=args.num_feature_levels,
-        two_stage=args.two_stage,             # Pass two_stage here
-        with_box_refine=args.with_box_refine  # Pass box_refine here
+        two_stage=args.two_stage,
+        with_box_refine=args.with_box_refine
     )
 
-    # Inject the prediction heads into the transformer for proposal generation
+    # Inject prediction heads into transformer for proposal generation
     if args.two_stage:
         model.transformer.decoder.class_embed = model.class_embed
         model.transformer.decoder.bbox_embed = model.bbox_embed
 
-    # Load the trained weights
     state_dict = torch.load(model_path, map_location="cpu")
     model.load_state_dict(state_dict)
-    
+
     model.to(device)
     model.eval()
-    
+
     return model
 
 
 class TestDataset(Dataset):
     """
-    Dataset loader for test images. 
-    Infers the image_id directly from the filename (e.g., '123.jpg' -> 123).
+    Dataset loader for test images.
+    Infers the image_id directly from the filename.
     """
+
     def __init__(self, test_dir, max_size=600):
         self.test_dir = test_dir
         self.max_size = max_size
-        self.image_files = [f for f in os.listdir(test_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        self.image_files = [
+            f for f in os.listdir(test_dir)
+            if f.lower().endswith(('.png', '.jpg', '.jpeg'))
+        ]
 
     def __len__(self):
         return len(self.image_files)
@@ -96,26 +100,22 @@ class TestDataset(Dataset):
     def __getitem__(self, idx):
         img_name = self.image_files[idx]
         img_path = os.path.join(self.test_dir, img_name)
-        
-        # Extract ID from filename by stripping the extension
+
         image_id = int(os.path.splitext(img_name)[0])
-        
+
         image = Image.open(img_path).convert("RGB")
         w, h = image.size
-        
-        # Exact bounded scaling used in training/validation
+
         scale_factor = 1.0
         new_w = int(w * scale_factor)
         new_h = int(h * scale_factor)
 
-        # Limit 1: Prevent feature map collapse for small digits
         min_dim = min(new_w, new_h)
         if min_dim < 400:
             fix_scale = 400.0 / min_dim
             new_w = int(new_w * fix_scale)
             new_h = int(new_h * fix_scale)
 
-        # Limit 2: Prevent large images from exceeding max_size
         max_dim = max(new_w, new_h)
         if max_dim > self.max_size:
             fix_scale = self.max_size / max_dim
@@ -125,7 +125,9 @@ class TestDataset(Dataset):
         image_tensor = TF.resize(image, (new_h, new_w))
         image_tensor = TF.to_tensor(image_tensor)
         image_tensor = TF.normalize(
-            image_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+            image_tensor,
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
         )
 
         return image_tensor, image_id, (h, w)
@@ -146,13 +148,35 @@ def box_cxcywh_to_xywh(x):
 
 @torch.no_grad()
 def main():
-    parser = argparse.ArgumentParser(description="Inference script for Deformable DETR")
-    parser.add_argument("--model_path", type=str, default="checkpoints/best_model.pth", help="Path to the trained weights")
-    parser.add_argument("--test_dir", type=str, default="data/test", help="Directory containing test images")
-    parser.add_argument("--output_file", type=str, default="pred.json", help="Path to save the JSON predictions")
+    parser = argparse.ArgumentParser(
+        description="Inference script for Deformable DETR"
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default="checkpoints/best_model.pth",
+        help="Path to the trained weights"
+    )
+    parser.add_argument(
+        "--test_dir",
+        type=str,
+        default="data/test",
+        help="Directory containing test images"
+    )
+    parser.add_argument(
+        "--output_file",
+        type=str,
+        default="pred.json",
+        help="Path to save the JSON predictions"
+    )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--threshold", type=float, default=0.05, help="Confidence threshold for saving boxes")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.05,
+        help="Confidence threshold for saving boxes"
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -161,9 +185,9 @@ def main():
 
     dataset = TestDataset(args.test_dir)
     dataloader = DataLoader(
-        dataset, 
-        batch_size=args.batch_size, 
-        shuffle=False, 
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=args.num_workers,
         collate_fn=collate_fn
     )
@@ -172,20 +196,19 @@ def main():
     progress_bar = tqdm(dataloader, desc="Running Inference")
 
     for images, image_ids, orig_sizes in progress_bar:
-        images = list(image.to(device) for image in images)
-        orig_sizes = torch.tensor(orig_sizes, dtype=torch.int64, device=device)
+        images = [img.to(device) for img in images]
+        orig_sizes = torch.tensor(
+            orig_sizes, dtype=torch.int64, device=device
+        )
 
-        # Standard FP32 forward pass
         outputs = model(images)
 
         out_logits = outputs['pred_logits']
         out_boxes = outputs['pred_boxes']
 
-        # Deformable DETR uses Focal Loss, so we use sigmoid
         prob = out_logits.sigmoid()
         scores, labels = prob.max(-1)
 
-        # Convert normalized [cx, cy, w, h] to absolute [x_min, y_min, w, h]
         boxes = box_cxcywh_to_xywh(out_boxes)
         img_h, img_w = orig_sizes.unbind(1)
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
@@ -193,7 +216,7 @@ def main():
 
         for i, image_id in enumerate(image_ids):
             keep = scores[i] > args.threshold
-            
+
             p_boxes = boxes[i][keep].cpu().tolist()
             p_scores = scores[i][keep].cpu().tolist()
             p_labels = labels[i][keep].cpu().tolist()
@@ -203,17 +226,18 @@ def main():
                     "image_id": image_id,
                     "bbox": box,
                     "score": score,
-                    "category_id": label + 1  # Revert to 1-indexed category
+                    "category_id": label + 1
                 })
 
-    # Sort descending by score so COCO evaluates your best guesses first
-    predictions = sorted(predictions, key=lambda x: x['score'], reverse=True)
+    predictions = sorted(
+        predictions, key=lambda x: x['score'], reverse=True
+    )
 
-    # Save to JSON
     with open(args.output_file, "w") as f:
         json.dump(predictions, f, indent=4)
-    
+
     print(f"\nSaved {len(predictions)} predictions to {args.output_file}")
+
 
 if __name__ == "__main__":
     main()
